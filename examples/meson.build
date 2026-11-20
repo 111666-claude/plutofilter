@@ -4,6 +4,25 @@ fs.copyfile('zhang-hanyun.jpg')
 fs.copyfile('royal-purple.png')
 fs.copyfile('firebrick-circle.png')
 
+morphology_inputs = [
+  'morphology-bright-spot.png',
+  'morphology-line-art.png',
+  'morphology-edge-map.png'
+]
+
+foreach input : morphology_inputs
+  fs.copyfile(input)
+endforeach
+
+morphology_generator = executable('generate-morphology-inputs',
+  '../tests/generate-morphology-inputs.c',
+  build_by_default: false
+)
+
+# Regenerates the morphology fixtures into the build directory; the committed copies under
+# examples/ are the reference inputs used by the dilate/erode tests below.
+test('generate-morphology-inputs', morphology_generator, args: [meson.current_build_dir()])
+
 example_dep = declare_dependency(
   sources: ['example.c'],
   dependencies: plutofilter_dep
@@ -55,6 +74,26 @@ blur_radii = [
 blur_tests = {}
 foreach radii : blur_radii
   blur_tests += {'zhang-hanyun-blur-' + '-'.join(radii): [zhang_hanyun_path] + radii}
+endforeach
+
+morphology_radii = [
+  ['0', '0'],
+  ['2', '2'],
+  ['5', '3']
+]
+
+morphology_input_paths = {}
+foreach input : morphology_inputs
+  morphology_input_paths += {input: meson.current_build_dir() / input}
+endforeach
+
+dilate_tests = {}
+erode_tests = {}
+foreach input, input_path : morphology_input_paths
+  foreach radii : morphology_radii
+    dilate_tests += {input.split('.')[0] + '-dilate-' + '-'.join(radii): [input_path] + radii}
+    erode_tests += {input.split('.')[0] + '-erode-' + '-'.join(radii): [input_path] + radii}
+  endforeach
 endforeach
 
 grayscale_tests = {}
@@ -113,6 +152,8 @@ example_sources = {
   'blend.c': blend_tests,
   'composite.c': composite_tests,
   'blur.c': blur_tests,
+  'dilate.c': dilate_tests,
+  'erode.c': erode_tests,
   'grayscale.c': grayscale_tests,
   'sepia.c': sepia_tests,
   'saturate.c': saturate_tests,

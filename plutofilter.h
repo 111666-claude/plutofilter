@@ -268,6 +268,75 @@ PLUTOFILTER_API void plutofilter_color_transform_linear_rgb_to_srgb(plutofilter_
 PLUTOFILTER_API void plutofilter_gaussian_blur(plutofilter_surface_t in, plutofilter_surface_t out, float std_deviation_x, float std_deviation_y);
 
 /**
+ * @brief Morphology operators for expanding or shrinking image regions.
+ */
+typedef enum plutofilter_morphology_operator {
+    PLUTOFILTER_MORPHOLOGY_OPERATOR_ERODE,    /**< Each output channel takes the minimum value in the neighborhood */
+    PLUTOFILTER_MORPHOLOGY_OPERATOR_DILATE    /**< Each output channel takes the maximum value in the neighborhood */
+} plutofilter_morphology_operator_t;
+
+/**
+ * @brief Applies a morphological operation (dilation or erosion) to the input surface.
+ *
+ * The operation is a separable, rectangular neighborhood filter with independent horizontal
+ * and vertical radii. For every output pixel, each of the four premultiplied ARGB channels is
+ * reduced independently over every input pixel whose center lies within
+ * `[x - radius_x, x + radius_x] x [y - radius_y, y + radius_y]`:
+ *
+ * - Dilation: each output channel is the maximum (per channel) of the neighborhood.
+ * - Erosion: each output channel is the minimum (per channel) of the neighborhood.
+ *
+ * Channels are never mixed, so fully transparent pixels (all channels zero) stay all-zero and
+ * the premultiplied-alpha semantics of the surface are preserved. Neighborhoods are clipped to
+ * the surface bounds (edge pixels are sampled at most once, never read out of bounds), so the
+ * output keeps the same dimensions as the overlapping input region.
+ *
+ * A radius of zero, negative or NaN means "no extent" along that axis; when both radii are
+ * non-positive the input is copied to the output unchanged. Effective radii are rounded to the
+ * nearest integer and capped at 512 pixels (an infinite radius saturates at that cap), and a
+ * radius larger than the surface simply covers the whole row or column. An empty surface (zero
+ * width or height) is left untouched. Like every PlutoFilter, this routine performs no dynamic
+ * allocation; the bounded scratch space lives on the stack, so an allocation failure cannot
+ * occur and every input above has a deterministic result. The input and output surfaces may
+ * refer to the same buffer.
+ *
+ * @param in The input surface.
+ * @param out The output surface.
+ * @param radius_x The neighborhood extent along the X axis, in pixels.
+ * @param radius_y The neighborhood extent along the Y axis, in pixels.
+ * @param op The morphology operator (dilation or erosion).
+ */
+PLUTOFILTER_API void plutofilter_morphology(plutofilter_surface_t in, plutofilter_surface_t out, float radius_x, float radius_y, plutofilter_morphology_operator_t op);
+
+/**
+ * @brief Dilates (expands) bright and opaque regions of the input surface.
+ *
+ * Equivalent to calling plutofilter_morphology() with
+ * PLUTOFILTER_MORPHOLOGY_OPERATOR_DILATE. Each output channel is the per-channel maximum of the
+ * rectangular neighborhood. The input and output surfaces may refer to the same buffer.
+ *
+ * @param in The input surface.
+ * @param out The output surface.
+ * @param radius_x The expansion extent along the X axis, in pixels.
+ * @param radius_y The expansion extent along the Y axis, in pixels.
+ */
+PLUTOFILTER_API void plutofilter_dilate(plutofilter_surface_t in, plutofilter_surface_t out, float radius_x, float radius_y);
+
+/**
+ * @brief Erodes (shrinks) bright and opaque regions of the input surface.
+ *
+ * Equivalent to calling plutofilter_morphology() with
+ * PLUTOFILTER_MORPHOLOGY_OPERATOR_ERODE. Each output channel is the per-channel minimum of the
+ * rectangular neighborhood. The input and output surfaces may refer to the same buffer.
+ *
+ * @param in The input surface.
+ * @param out The output surface.
+ * @param radius_x The shrinkage extent along the X axis, in pixels.
+ * @param radius_y The shrinkage extent along the Y axis, in pixels.
+ */
+PLUTOFILTER_API void plutofilter_erode(plutofilter_surface_t in, plutofilter_surface_t out, float radius_x, float radius_y);
+
+/**
  * @brief Blend modes for combining source and backdrop surfaces.
  */
 typedef enum plutofilter_blend_mode {
@@ -918,6 +987,144 @@ void plutofilter_gaussian_blur(plutofilter_surface_t in, plutofilter_surface_t o
     plutofilter__box_blur(in, out, intermediate, kernel_width, kernel_height);
     plutofilter__box_blur(out, out, intermediate, kernel_width, kernel_height);
     plutofilter__box_blur(out, out, intermediate, kernel_width, kernel_height);
+}
+
+#define PLUTOFILTER_MAX_MORPHOLOGY_RADIUS 512
+
+typedef struct {
+    int index;
+    uint8_t value;
+} plutofilter__morphology_node_t;
+
+/*
+ * One separable pass of the morphology filter. A monotonic deque per channel maintains the
+ * running maximum (dilation) or minimum (erosion) of the clipped sliding window in linear time.
+ * Only already-consumed input positions are ever overwritten, so `in` and `out` may alias.
+ */
+#define PLUTOFILTER_MORPHOLOGY_DEQUE_SIZE (PLUTOFILTER_MAX_MORPHOLOGY_RADIUS * 2 + 1)
+
+static void plutofilter__morphology_pass(plutofilter_surface_t in, plutofilter_surface_t out, int radius, int horizontal, plutofilter_morphology_operator_t op)
+{
+    if(radius <= 0)
+        return;
+
+    const int line_length = horizontal ? out.width : out.height;
+    const int line_count = horizontal ? out.height : out.width;
+    const int dilate = (op == PLUTOFILTER_MORPHOLOGY_OPERATOR_DILATE);
+    const uint8_t channel_shift[4] = { 16, 8, 0, 24 }; /* red, green, blue, alpha */
+
+    for(int line = 0; line < line_count; line++) {
+        /* One circular monotonic deque per channel. The clipped window never holds more than
+         * min(2 * radius + 1, line_length) positions, so these buffers cannot overflow. */
+        plutofilter__morphology_node_t deque[4][PLUTOFILTER_MORPHOLOGY_DEQUE_SIZE];
+        int head[4] = { 0, 0, 0, 0 };
+        int tail[4] = { 0, 0, 0, 0 };
+
+        for(int i = 0; i < line_length; i++) {
+            int x = horizontal ? i : line;
+            int y = horizontal ? line : i;
+            uint32_t pixel = PLUTOFILTER_GET_PIXEL(in, x, y);
+
+            for(int channel = 0; channel < 4; channel++) {
+                uint8_t value = (uint8_t)(pixel >> channel_shift[channel]);
+
+                while(head[channel] != tail[channel]) {
+                    plutofilter__morphology_node_t* back = &deque[channel][(tail[channel] + PLUTOFILTER_MORPHOLOGY_DEQUE_SIZE - 1) % PLUTOFILTER_MORPHOLOGY_DEQUE_SIZE];
+                    int replace = dilate ? (back->value <= value) : (back->value >= value);
+                    if(!replace)
+                        break;
+                    tail[channel] = (tail[channel] + PLUTOFILTER_MORPHOLOGY_DEQUE_SIZE - 1) % PLUTOFILTER_MORPHOLOGY_DEQUE_SIZE;
+                }
+
+                deque[channel][tail[channel]].index = i;
+                deque[channel][tail[channel]].value = value;
+                tail[channel] = (tail[channel] + 1) % PLUTOFILTER_MORPHOLOGY_DEQUE_SIZE;
+            }
+
+            int output_index = i - radius;
+            if(output_index >= 0) {
+                int window_start = output_index - radius;
+
+                int ox = horizontal ? output_index : line;
+                int oy = horizontal ? line : output_index;
+                uint32_t result = 0;
+
+                for(int channel = 0; channel < 4; channel++) {
+                    while(deque[channel][head[channel]].index < window_start)
+                        head[channel] = (head[channel] + 1) % PLUTOFILTER_MORPHOLOGY_DEQUE_SIZE;
+
+                    result |= (uint32_t)deque[channel][head[channel]].value << channel_shift[channel];
+                }
+
+                PLUTOFILTER_GET_PIXEL(out, ox, oy) = result;
+            }
+        }
+
+        /* Flush the positions whose window only completes at the right/bottom edge. */
+        for(int output_index = PLUTOFILTER_MAX(0, line_length - radius); output_index < line_length; output_index++) {
+            int window_start = output_index - radius;
+
+            int ox = horizontal ? output_index : line;
+            int oy = horizontal ? line : output_index;
+            uint32_t result = 0;
+
+            for(int channel = 0; channel < 4; channel++) {
+                while(deque[channel][head[channel]].index < window_start)
+                    head[channel] = (head[channel] + 1) % PLUTOFILTER_MORPHOLOGY_DEQUE_SIZE;
+
+                result |= (uint32_t)deque[channel][head[channel]].value << channel_shift[channel];
+            }
+
+            PLUTOFILTER_GET_PIXEL(out, ox, oy) = result;
+        }
+    }
+}
+
+static int plutofilter__morphology_radius(float radius)
+{
+    int value;
+
+    if(!(radius > 0.0f))          /* zero, negative and NaN radii have no extent */
+        return 0;
+    if(isinf(radius))
+        return PLUTOFILTER_MAX_MORPHOLOGY_RADIUS;
+
+    value = (int)(floorf(radius + 0.5f));
+    if(value > PLUTOFILTER_MAX_MORPHOLOGY_RADIUS)
+        value = PLUTOFILTER_MAX_MORPHOLOGY_RADIUS;
+
+    return value;
+}
+
+void plutofilter_morphology(plutofilter_surface_t in, plutofilter_surface_t out, float radius_x, float radius_y, plutofilter_morphology_operator_t op)
+{
+    PLUTOFILTER_OVERLAP_SURFACE(in, out);
+
+    if(out.width == 0 || out.height == 0)
+        return;
+
+    int rx = plutofilter__morphology_radius(radius_x);
+    int ry = plutofilter__morphology_radius(radius_y);
+
+    if(rx == 0 && ry == 0) {
+        int size = out.width * out.height;
+        for(int i = 0; i < size; i++)
+            out.pixels[i] = in.pixels[i];
+        return;
+    }
+
+    plutofilter__morphology_pass(in, out, rx, 1, op);
+    plutofilter__morphology_pass(out, out, ry, 0, op);
+}
+
+void plutofilter_dilate(plutofilter_surface_t in, plutofilter_surface_t out, float radius_x, float radius_y)
+{
+    plutofilter_morphology(in, out, radius_x, radius_y, PLUTOFILTER_MORPHOLOGY_OPERATOR_DILATE);
+}
+
+void plutofilter_erode(plutofilter_surface_t in, plutofilter_surface_t out, float radius_x, float radius_y)
+{
+    plutofilter_morphology(in, out, radius_x, radius_y, PLUTOFILTER_MORPHOLOGY_OPERATOR_ERODE);
 }
 
 static inline int plutofilter__div255(int x)

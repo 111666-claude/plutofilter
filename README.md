@@ -54,6 +54,9 @@ int main(void)
 ## Features
 
 - [Gaussian Blur](#gaussian-blur)
+- [Morphology](#morphology)
+  - [Dilate](#morphology-dilate)
+  - [Erode](#morphology-erode)
 - [Color Transform](#color-transform)
   - [Grayscale](#grayscale)
   - [Sepia](#sepia)
@@ -95,7 +98,6 @@ int main(void)
 
 ## Roadmap
 
-- [Morphology](https://www.w3.org/TR/SVG11/filters.html#feMorphologyElement)
 - [Diffuse Lighting](https://www.w3.org/TR/SVG11/filters.html#feDiffuseLightingElement)
 - [Specular Lighting](https://www.w3.org/TR/SVG11/filters.html#feSpecularLightingElement)
 - [Convolve Matrix](https://www.w3.org/TR/SVG11/filters.html#feConvolveMatrixElement)
@@ -113,6 +115,52 @@ Applies a Gaussian blur to the input surface using separable convolution. The am
 | `0x0`                                | `5x5`                                | `10x10`                                |
 | ------------------------------------ | ------------------------------------ | -------------------------------------- |
 | ![](tests/zhang-hanyun-blur-0-0.jpg) | ![](tests/zhang-hanyun-blur-5-5.png) | ![](tests/zhang-hanyun-blur-10-10.png) |
+
+## Morphology
+
+```c
+void plutofilter_morphology(plutofilter_surface_t in, plutofilter_surface_t out, float radius_x, float radius_y, plutofilter_morphology_operator_t op);
+```
+
+Applies a rectangular, separable morphology filter with independent horizontal and vertical radii. For every output pixel, each premultiplied ARGB channel is reduced on its own over every input pixel whose center lies within `[x - radius_x, x + radius_x] × [y - radius_y, y + radius_y]`. Because channels never mix, fully transparent pixels (all channels zero) stay all-zero, so the premultiplied-alpha semantics are preserved. Neighborhoods are clipped to the surface bounds — edge pixels are sampled at most once and are never read out of bounds — and the output keeps the same dimensions as the input.
+
+A radius of zero or below (including `NaN`) means no extent on that axis; when both radii are non-positive the input is copied unchanged. Effective radii round to the nearest integer, are capped at `512`, and a radius larger than the surface simply covers the whole row or column. Like every PlutoFilter, the routine performs no dynamic allocation and may be used in-place (`in == out`), which makes it safe to chain ahead of a blur:
+
+```c
+/* Expand an outline first, then soften it — a halo/shadow without edge noise. */
+plutofilter_dilate(surface, surface, 2.0f, 2.0f);
+plutofilter_gaussian_blur(surface, surface, 3.0f, 3.0f);
+```
+
+The synthetic fixtures below deliberately exercise the neighborhood contract: a single bright pixel on a dark field, opaque and translucent strokes on transparency, and a one-pixel edge frame.
+
+### <a id="morphology-dilate"></a>Dilate
+
+```c
+void plutofilter_dilate(plutofilter_surface_t in, plutofilter_surface_t out, float radius_x, float radius_y);
+```
+
+Each output channel takes the **maximum** value in the neighborhood, so bright and opaque regions grow outward by the radius.
+
+| Fixture | Radius `0,0` (copy) | Radius `2,2` | Radius `5,3` | Explanation |
+| ------- | ------------------- | ------------ | ------------ | ----------- |
+| Bright spot | ![](tests/morphology-bright-spot-dilate-0-0.jpg) | ![](tests/morphology-bright-spot-dilate-2-2.jpg) | ![](tests/morphology-bright-spot-dilate-5-3.jpg) | One white pixel expands into a `(2·rx+1)×(2·ry+1)` rectangle; the dark background is untouched outside it. |
+| Transparent line art | ![](tests/morphology-line-art-dilate-0-0.png) | ![](tests/morphology-line-art-dilate-2-2.png) | ![](tests/morphology-line-art-dilate-5-3.png) | The opaque strokes thicken and the soft-alpha block spreads while keeping partial transparency; transparent pixels stay transparent. |
+| Edge map | ![](tests/morphology-edge-map-dilate-0-0.jpg) | ![](tests/morphology-edge-map-dilate-2-2.jpg) | ![](tests/morphology-edge-map-dilate-5-3.jpg) | The one-pixel frame thickens by the radius on both its inner and outer sides. |
+
+### <a id="morphology-erode"></a>Erode
+
+```c
+void plutofilter_erode(plutofilter_surface_t in, plutofilter_surface_t out, float radius_x, float radius_y);
+```
+
+Each output channel takes the **minimum** value in the neighborhood, so bright and opaque regions shrink, and thin features that cannot cover the neighborhood disappear.
+
+| Fixture | Radius `0,0` (copy) | Radius `2,2` | Radius `5,3` | Explanation |
+| ------- | ------------------- | ------------ | ------------ | ----------- |
+| Bright spot | ![](tests/morphology-bright-spot-erode-0-0.jpg) | ![](tests/morphology-bright-spot-erode-2-2.jpg) | ![](tests/morphology-bright-spot-erode-5-3.jpg) | The single bright pixel vanishes immediately: every neighborhood around it contains the darker background. |
+| Transparent line art | ![](tests/morphology-line-art-erode-0-0.png) | ![](tests/morphology-line-art-erode-2-2.png) | ![](tests/morphology-line-art-erode-5-3.png) | The thin cross strokes erode away, while the larger translucent block shrinks instead of disappearing. |
+| Edge map | ![](tests/morphology-edge-map-erode-0-0.jpg) | ![](tests/morphology-edge-map-erode-2-2.jpg) | ![](tests/morphology-edge-map-erode-5-3.jpg) | The one-pixel frame is removed entirely: each frame pixel has black neighbors inside the radius. |
 
 ## Color Transform
 
